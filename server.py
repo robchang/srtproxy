@@ -4,6 +4,7 @@ SRT-to-HLS proxy server.
 
 Starts FFmpeg on-demand when a viewer explicitly requests it,
 and stops it after a period of inactivity to save resources.
+Auto-restarts FFmpeg on unexpected crashes while viewers are active.
 """
 
 import glob
@@ -33,11 +34,13 @@ class FFmpegManager:
         self._lock = threading.Lock()
         self._last_activity = 0.0
         self._watchdog_thread = None
+        self._intentional_stop = False
 
     def start(self):
         """Explicitly start FFmpeg (called from /api/start)."""
         self._last_activity = time.time()
         with self._lock:
+            self._intentional_stop = False
             if self._proc is not None and self._proc.poll() is None:
                 return
             self._start()
@@ -77,16 +80,25 @@ class FFmpegManager:
 
     def _watchdog(self):
         while True:
-            time.sleep(10)
+            time.sleep(5)
             with self._lock:
-                if self._proc is None or self._proc.poll() is not None:
-                    print("[ffmpeg] Process not running, watchdog exiting")
+                if self._intentional_stop:
                     return
+
+                proc_dead = self._proc is None or self._proc.poll() is not None
                 idle = time.time() - self._last_activity
-                if idle >= IDLE_TIMEOUT:
+
+                # If idle too long, stop intentionally
+                if not proc_dead and idle >= IDLE_TIMEOUT:
                     print(f"[ffmpeg] No viewers for {IDLE_TIMEOUT}s, stopping")
+                    self._intentional_stop = True
                     self._stop()
                     return
+
+                # If FFmpeg crashed but viewers are still active, restart
+                if proc_dead and idle < IDLE_TIMEOUT:
+                    print("[ffmpeg] Process crashed, restarting for active viewers")
+                    self._start()
 
     def _stop(self):
         if self._proc and self._proc.poll() is None:
@@ -100,10 +112,14 @@ class FFmpegManager:
 
     def _cleanup_hls_files(self):
         for f in glob.glob(os.path.join(HLS_DIR, "*")):
-            os.remove(f)
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
     def stop(self):
         with self._lock:
+            self._intentional_stop = True
             self._stop()
 
     @property
@@ -126,9 +142,8 @@ class StreamHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path == "/api/status":
             self.send_json({"running": ffmpeg_mgr.is_running})
         elif self.path.startswith("/hls/"):
-            # Only update heartbeat, never start FFmpeg from here
             ffmpeg_mgr.heartbeat()
-            filename = self.path[len("/hls/"):]
+            filename = os.path.basename(self.path[len("/hls/"):])
             filepath = os.path.join(HLS_DIR, filename)
             if os.path.isfile(filepath):
                 if filename.endswith(".m3u8"):

@@ -17,11 +17,15 @@
             min-height: 100vh;
         }
         h1 { margin-bottom: 1rem; font-size: 1.5rem; }
-        #player {
+        #videoWrap {
+            position: relative;
             width: 90vw;
             max-width: 1280px;
-            background: #000;
             display: none;
+        }
+        #player {
+            width: 100%;
+            background: #000;
         }
         #status {
             margin-top: 1rem;
@@ -45,30 +49,34 @@
 </head>
 <body>
     <h1>SRT Live Stream</h1>
-    <video id="player" controls autoplay muted></video>
+    <div id="videoWrap">
+        <video id="player" controls autoplay muted playsinline></video>
+    </div>
     <div id="status">Click to start watching the stream.</div>
     <button id="watchBtn">Start Watching</button>
 
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <script>
         const video = document.getElementById('player');
-        const status = document.getElementById('status');
+        const videoWrap = document.getElementById('videoWrap');
+        const statusEl = document.getElementById('status');
         const watchBtn = document.getElementById('watchBtn');
         const hlsUrl = '/hls/stream.m3u8';
         let hls = null;
+        let recovering = false;
 
         watchBtn.addEventListener('click', startStream);
 
         function startStream() {
             watchBtn.disabled = true;
             watchBtn.classList.add('hidden');
-            status.textContent = 'Starting stream...';
+            videoWrap.style.display = 'block';
+            statusEl.textContent = 'Starting stream...';
 
-            // Tell the server to start FFmpeg
             fetch('/api/start')
                 .then(() => waitForPlaylist())
                 .catch(() => {
-                    status.textContent = 'Failed to connect to server.';
+                    statusEl.textContent = 'Failed to connect to server.';
                     showWatchButton();
                 });
         }
@@ -79,58 +87,112 @@
                     if (res.ok) {
                         startPlayer();
                     } else {
-                        status.textContent = 'Waiting for stream to begin...';
+                        statusEl.textContent = 'Waiting for stream to begin...';
                         setTimeout(waitForPlaylist, 2000);
                     }
                 })
                 .catch(() => {
-                    status.textContent = 'Waiting for stream to begin...';
+                    statusEl.textContent = 'Waiting for stream to begin...';
                     setTimeout(waitForPlaylist, 2000);
                 });
         }
 
         function startPlayer() {
-            video.style.display = 'block';
+            if (hls) {
+                hls.destroy();
+                hls = null;
+            }
+            recovering = false;
 
             if (Hls.isSupported()) {
                 hls = new Hls({
                     liveSyncDurationCount: 3,
                     liveMaxLatencyDurationCount: 6,
+                    liveDurationInfinity: true,
                     enableWorker: true,
                     lowLatencyMode: true,
+                    manifestLoadingMaxRetry: 10,
+                    manifestLoadingRetryDelay: 2000,
+                    levelLoadingMaxRetry: 10,
+                    levelLoadingRetryDelay: 2000,
+                    fragLoadingMaxRetry: 10,
+                    fragLoadingRetryDelay: 2000,
                 });
                 hls.loadSource(hlsUrl);
                 hls.attachMedia(video);
+
                 hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                    status.textContent = 'Stream connected.';
-                    video.play().catch(() => {});
+                    onStreamConnected();
                 });
-                hls.on(Hls.Events.ERROR, (event, data) => {
-                    if (data.fatal) {
-                        status.textContent = 'Stream ended.';
-                        hls.destroy();
-                        hls = null;
-                        video.style.display = 'none';
-                        showWatchButton();
+
+                // Detect recovery success: fragments loading again after error
+                hls.on(Hls.Events.FRAG_LOADED, () => {
+                    if (recovering) {
+                        recovering = false;
+                        statusEl.textContent = 'Stream connected.';
                     }
+                });
+
+                hls.on(Hls.Events.ERROR, (event, data) => {
+                    if (!data.fatal) return;
+
+                    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                        if (!recovering) {
+                            recovering = true;
+                            statusEl.textContent = 'Connection lost. Recovering...';
+                            hls.startLoad();
+                            return;
+                        }
+                    } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                        if (!recovering) {
+                            recovering = true;
+                            statusEl.textContent = 'Media error. Recovering...';
+                            hls.recoverMediaError();
+                            return;
+                        }
+                    }
+
+                    statusEl.textContent = 'Stream interrupted. Reconnecting...';
+                    hls.destroy();
+                    hls = null;
+                    reconnect();
                 });
             } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
                 video.src = hlsUrl;
                 video.addEventListener('loadedmetadata', () => {
-                    status.textContent = 'Stream connected.';
-                    video.play().catch(() => {});
+                    onStreamConnected();
                 });
                 video.addEventListener('error', () => {
-                    status.textContent = 'Stream ended.';
-                    video.style.display = 'none';
-                    showWatchButton();
+                    statusEl.textContent = 'Stream interrupted. Reconnecting...';
+                    reconnect();
                 });
             } else {
-                status.textContent = 'HLS is not supported in this browser.';
+                statusEl.textContent = 'HLS is not supported in this browser.';
             }
         }
 
+        function onStreamConnected() {
+            statusEl.textContent = 'Stream connected.';
+            recovering = false;
+            // Start muted (required by browsers), then unmute immediately
+            video.muted = true;
+            video.play().then(() => {
+                video.muted = false;
+            }).catch(() => {});
+        }
+
+        function reconnect() {
+            fetch('/api/start')
+                .then(() => {
+                    setTimeout(waitForPlaylist, 3000);
+                })
+                .catch(() => {
+                    setTimeout(reconnect, 5000);
+                });
+        }
+
         function showWatchButton() {
+            videoWrap.style.display = 'none';
             watchBtn.disabled = false;
             watchBtn.classList.remove('hidden');
         }
