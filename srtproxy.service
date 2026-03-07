@@ -1,0 +1,17 @@
+[Unit]
+Description=SRT to HLS Proxy Server
+After=network.target
+
+[Service]
+Type=simple
+User=srtproxy
+Group=srtproxy
+WorkingDirectory=/opt/srtproxy
+ExecStart=/usr/bin/python3 /opt/srtproxy/server.py
+Restart=always
+RestartSec=5
+Environment=SRT_URL=srt://96.77.253.169:3039
+Environment=HTTP_PORT=9090
+
+[Install]
+WantedBy=multi-user.target
