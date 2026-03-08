@@ -50,6 +50,8 @@ class FFmpegManager:
         self._last_activity = time.time()
 
     def _start(self):
+        # Ensure any previous process is fully dead before starting a new one
+        self._stop()
         self._cleanup_hls_files()
         cmd = [
             "ffmpeg",
